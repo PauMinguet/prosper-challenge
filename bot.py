@@ -4,18 +4,15 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Pipecat Quickstart Example.
+"""Prosper Health voice agent.
 
-The example runs a simple voice AI bot that you can connect to using your
-browser and speak with it. You can also deploy this bot to Pipecat Cloud.
+A Pipecat voice bot that schedules appointments against a local EHR HTTP API.
+Conversation structure lives in `flow.py`; the EHR client lives in `ehr_client.py`.
 
-Required AI services:
-- ElevenLabs (Speech-to-Text and Text-to-Speech)
-- OpenAI (LLM)
+Run the bot::
 
-Run the bot using::
-
-    uv run bot.py
+    uv run uvicorn ehr.api:app --port 8000   # in one terminal
+    uv run bot.py                            # in another
 """
 
 import os
@@ -36,7 +33,6 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 logger.info("✅ Silero VAD model loaded")
 
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
 
 logger.info("Loading pipeline components...")
 from pipecat.pipeline.pipeline import Pipeline
@@ -59,16 +55,24 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
 )
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
+from pipecat_flows import FlowManager
+
+from ehr_client import EHRClient
+from flow import create_greet_node
+
 logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info(f"Starting bot")
+    logger.info("Starting bot")
 
     elevenlabs_key = os.environ["ELEVENLABS_API_KEY"]
-    stt = ElevenLabsRealtimeSTTService(api_key=elevenlabs_key)
+    stt = ElevenLabsRealtimeSTTService(
+        api_key=elevenlabs_key,
+        params=ElevenLabsRealtimeSTTService.InputParams(language_code="en"),
+    )
     tts = ElevenLabsTTSService(
         api_key=elevenlabs_key,
         voice_id="SAz9YHcvj6GT2YYXdXww",
@@ -76,15 +80,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     llm = OpenAILLMService(api_key=os.environ["OPENAI_API_KEY"])
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a friendly AI assistant. Respond naturally and keep your answers conversational.",
-        },
-    ]
-
-    context = LLMContext(messages)
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context = LLMContext()
+    context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=UserTurnStrategies(
@@ -97,14 +94,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     pipeline = Pipeline(
         [
-            transport.input(),  # Transport user input
-            rtvi,  # RTVI processor
+            transport.input(),
+            rtvi,
             stt,
-            user_aggregator,  # User responses
-            llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            assistant_aggregator,  # Assistant spoken responses
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
         ]
     )
 
@@ -117,21 +114,30 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         observers=[RTVIObserver(rtvi)],
     )
 
+    ehr = EHRClient()
+
+    flow_manager = FlowManager(
+        task=task,
+        llm=llm,
+        context_aggregator=context_aggregator,
+        transport=transport,
+    )
+    flow_manager.state["ehr"] = ehr
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
-        # Kick off the conversation.
-        messages.append(
-            {
-                "role": "system",
-                "content": "Say hello and briefly introduce yourself as a digital assistant from the Prosper Health clinic.",
-            }
-        )
-        await task.queue_frames([LLMRunFrame()])
+        logger.info("Client connected — initializing flow")
+        try:
+            await flow_manager.initialize(create_greet_node())
+            logger.info("Flow initialized")
+        except Exception:
+            logger.exception("flow_manager.initialize raised")
+            raise
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
+        logger.info("Client disconnected")
+        await ehr.aclose()
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
